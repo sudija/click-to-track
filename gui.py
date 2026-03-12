@@ -1,6 +1,6 @@
 """
 Professional PyQt5 GUI for Click-to-Track system.
-Modern dark theme with controls and status display.
+Modern dark theme with sliders, controls, and status display.
 """
 
 import sys
@@ -9,7 +9,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QGroupBox, QFrame, QSizePolicy,
-    QComboBox, QCheckBox, QSpacerItem, QScrollArea
+    QComboBox, QCheckBox, QSpacerItem
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QSize
 from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
@@ -17,7 +17,7 @@ from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPalette, QIcon
 import config
 from video_source import VideoSource
 from tracker_cv import Tracker, BBox, TrackerState, TrackerType
-from imu import create_imu_provider
+from servo_controller import ServoController
 
 # Style constants
 DARK_BG = "#1a1a2e"
@@ -318,6 +318,8 @@ class ControlPanel(QWidget):
     gain_changed = pyqtSignal(float)
     exposure_changed = pyqtSignal(int)
     reset_triggered = pyqtSignal()
+    features_toggled = pyqtSignal(bool)
+    flip_toggled = pyqtSignal(bool)
     tracker_type_changed = pyqtSignal(str)  # "CSRT", "KCF", "MOSSE"
     
     def __init__(self):
@@ -334,6 +336,7 @@ class ControlPanel(QWidget):
         main_layout.setSpacing(0)
         
         # Create scroll area
+        from PyQt5.QtWidgets import QScrollArea
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -394,6 +397,10 @@ class ControlPanel(QWidget):
         focus_group = self._create_focus_section()
         layout.addWidget(focus_group)
         
+        # Servo controls
+        servo_group = self._create_servo_section()
+        layout.addWidget(servo_group)
+        
         # Spacer
         layout.addSpacerItem(QSpacerItem(20, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
         
@@ -411,7 +418,7 @@ class ControlPanel(QWidget):
         
         scroll.setWidget(content)
         main_layout.addWidget(scroll)
-
+    
     def _create_status_section(self):
         group = QGroupBox("Status")
         layout = QVBoxLayout(group)
@@ -499,6 +506,39 @@ class ControlPanel(QWidget):
         
         self.tracker_type_changed.emit(tracker_type)
 
+    def _create_servo_section(self):
+        group = QGroupBox("Servo Pan")
+        layout = QVBoxLayout(group)
+        layout.setSpacing(6)
+        layout.setContentsMargins(10, 20, 10, 10)
+        
+        self.servo_status_label = QLabel("Connecting...")
+        self.servo_status_label.setObjectName("subtitleLabel")
+        layout.addWidget(self.servo_status_label)
+        
+        angle_layout = QHBoxLayout()
+        angle_layout.addWidget(QLabel("Angle:"))
+        self.servo_angle_label = QLabel("0°")
+        self.servo_angle_label.setObjectName("valueLabel")
+        angle_layout.addWidget(self.servo_angle_label)
+        angle_layout.addStretch()
+        layout.addLayout(angle_layout)
+        
+        return group
+    
+    def update_servo_status(self, connected: bool):
+        """Update servo connection status label."""
+        if connected:
+            self.servo_status_label.setText("● Connected")
+            self.servo_status_label.setStyleSheet(f"color: {SUCCESS};")
+        else:
+            self.servo_status_label.setText("✗ Not connected")
+            self.servo_status_label.setStyleSheet(f"color: {DANGER};")
+    
+    def update_servo_angle(self, angle: float):
+        """Update displayed servo angle."""
+        self.servo_angle_label.setText(f"{angle:.1f}°")
+    
     def _create_camera_section(self):
         group = QGroupBox("Camera")
         layout = QVBoxLayout(group)
@@ -580,7 +620,24 @@ class ControlPanel(QWidget):
         layout.addWidget(af_btn)
         
         return group
-
+    
+    def _create_display_section(self):
+        group = QGroupBox("Display")
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 20, 10, 10)
+        
+        self.features_check = QCheckBox("Show points")
+        self.features_check.setChecked(True)
+        self.features_check.toggled.connect(self.features_toggled.emit)
+        layout.addWidget(self.features_check)
+        
+        self.flip_check = QCheckBox("Flip 180°")
+        self.flip_check.setChecked(True)   # Camera mounted upside down
+        self.flip_check.toggled.connect(self.flip_toggled.emit)
+        layout.addWidget(self.flip_check)
+        
+        return group
+    
     def _on_light_preset(self, preset):
         # Update button states
         for name, btn in self.light_buttons.items():
@@ -644,7 +701,8 @@ class MainWindow(QMainWindow):
         # Initialize components
         self.video_source = None
         self.tracker = None
-        self.imu = None
+        self.servo = None
+        self.flip_image = True   # Camera mounted upside down by default
         self.pending_bbox = None
         self.fps_counter = FPSCounter()
         
@@ -655,7 +713,7 @@ class MainWindow(QMainWindow):
         # Start video timer
         self.timer = QTimer()
         self.timer.timeout.connect(self._process_frame)
-        self.timer.start(30)  # ~33 FPS
+        self.timer.start(40)  # ~25 FPS - avoids overwhelming the camera
     
     def _setup_ui(self):
         central = QWidget()
@@ -678,7 +736,7 @@ class MainWindow(QMainWindow):
         # Control panel (sidebar) - fixed width range
         self.control_panel = ControlPanel()
         layout.addWidget(self.control_panel, stretch=0)
-
+    
     def _setup_connections(self):
         # Video widget signals
         self.video_widget.clicked.connect(self._on_click)
@@ -691,6 +749,8 @@ class MainWindow(QMainWindow):
         self.control_panel.gain_changed.connect(self._on_gain)
         self.control_panel.exposure_changed.connect(self._on_exposure)
         self.control_panel.reset_triggered.connect(self._on_reset)
+        self.control_panel.features_toggled.connect(self._on_features_toggle)
+        self.control_panel.flip_toggled.connect(self._on_flip_toggle)
         self.control_panel.tracker_type_changed.connect(self._on_tracker_type)
     
     def _init_tracker(self):
@@ -700,14 +760,17 @@ class MainWindow(QMainWindow):
             print("Failed to open video source!")
             return
         
-        # Initialize IMU if enabled
-        if config.IMU_ENABLED:
-            self.imu = create_imu_provider()
-        
         # Initialize tracker with default type
         self.tracker_type = TrackerType.CSRT
         self.tracker = Tracker(self.tracker_type)
-
+        
+        # Initialize servo controller and connect immediately
+        simulate = getattr(config, 'SERVO_SIMULATE', True)
+        invert   = getattr(config, 'SERVO_INVERT', False)
+        self.servo = ServoController(simulate=simulate, invert=invert)
+        ok = self.servo.connect()
+        self.control_panel.update_servo_status(ok)
+    
     def _process_frame(self):
         if self.video_source is None or self.tracker is None:
             return
@@ -716,8 +779,14 @@ class MainWindow(QMainWindow):
         if frame is None:
             return
         
+        # Flip frame if enabled (camera mounted upside down)
+        if self.flip_image:
+            frame.image = cv2.rotate(frame.image, cv2.ROTATE_180)
+            frame.gray  = cv2.rotate(frame.gray,  cv2.ROTATE_180)
+        
         # Handle pending bbox selection
         if self.pending_bbox is not None:
+            print(f"Tracker init: frame shape={frame.image.shape} bbox={self.pending_bbox}")
             self.tracker.initialize(frame.image, self.pending_bbox, frame.timestamp)
             self.pending_bbox = None
         
@@ -739,7 +808,12 @@ class MainWindow(QMainWindow):
             self.tracker.get_confidence(),
             fps
         )
-
+        
+        # Drive servo to keep target centred
+        if bbox is not None and self.servo is not None:
+            self.servo.update(target_x=bbox.cx, frame_width=frame.image.shape[1])
+            self.control_panel.update_servo_angle(self.servo.get_angle())
+    
     def _draw_overlay(self, frame: np.ndarray, bbox) -> np.ndarray:
         """Draw tracking overlay on frame."""
         display = frame.copy()
@@ -773,7 +847,7 @@ class MainWindow(QMainWindow):
                              (corners[0][0] + bar_w, bar_y), color, -1)
         
         return display
-
+    
     def _on_click(self, x, y):
         """Handle click to select target."""
         self.pending_bbox = BBox(
@@ -808,15 +882,26 @@ class MainWindow(QMainWindow):
     
     def _on_gain(self, gain):
         if self.video_source:
-            self.video_source.set_camera_settings(analog_gain=gain)
+            self.video_source.set_camera_settings(
+                analog_gain=gain
+            )
     
     def _on_exposure(self, exposure_us):
         if self.video_source:
-            self.video_source.set_camera_settings(auto_exposure=False, exposure_time=exposure_us)
+            self.video_source.set_camera_settings(
+                auto_exposure=False,
+                exposure_time=exposure_us
+            )
     
     def _on_reset(self):
         if self.tracker:
             self.tracker.reset()
+    
+    def _on_features_toggle(self, show):
+        config.DRAW_FEATURES = show
+    
+    def _on_flip_toggle(self, flipped):
+        self.flip_image = flipped
     
     def _on_tracker_type(self, type_name):
         """Change tracker algorithm."""
@@ -837,6 +922,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Clean up on close."""
         self.timer.stop()
+        if self.servo:
+            self.servo.disconnect()
         if self.video_source:
             self.video_source.release()
         event.accept()
