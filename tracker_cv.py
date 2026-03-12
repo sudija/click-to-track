@@ -16,6 +16,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
+print("tracker_cv.py: VERSION 2 — contiguous fix active")
+
 
 class TrackerType(Enum):
     """Available tracker types."""
@@ -131,12 +133,18 @@ class Tracker:
 
     def _create_tracker(self) -> cv2.Tracker:
         """Create OpenCV tracker instance."""
+        
         if self.tracker_type == TrackerType.CSRT:
+            # cv2.TrackerCSRT_create is available
             return cv2.TrackerCSRT_create()
+                
         elif self.tracker_type == TrackerType.KCF:
             return cv2.TrackerKCF_create()
+                
         elif self.tracker_type == TrackerType.MOSSE:
+            # MOSSE is only in legacy
             return cv2.legacy.TrackerMOSSE_create()
+        
         # Default to CSRT
         return cv2.TrackerCSRT_create()
 
@@ -152,6 +160,9 @@ class Tracker:
         # Ensure frame is color (trackers need BGR)
         if len(frame.shape) == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        
+        # Ensure C-contiguous memory layout (required after rotate/flip operations)
+        frame = np.ascontiguousarray(frame)
         
         self.frame_h, self.frame_w = frame.shape[:2]
         self.last_timestamp = timestamp
@@ -180,22 +191,34 @@ class Tracker:
         try:
             success = self.cv_tracker.init(frame, rect)
         except Exception as e:
-            logger.error(f"Tracker init exception: {e}")
+            print(f"Tracker init EXCEPTION: {type(e).__name__}: {e}")
             success = False
+
+        # If primary tracker failed, try fallbacks
+        if not success:
+            for fallback in [cv2.TrackerKCF_create, cv2.legacy.TrackerMOSSE_create]:
+                try:
+                    self.cv_tracker = fallback()
+                    success = self.cv_tracker.init(frame, rect)
+                    if success:
+                        print(f"Tracker OK via fallback {fallback.__name__}: {rect}")
+                        break
+                except Exception:
+                    continue
         
         if success:
             self.state = TrackerState.TRACKING
             self.confidence = 1.0
             self.lost_frames = 0
-            
-            # Store template for potential recovery
             self._store_template(frame)
-            
-            logger.info(f"Tracker initialized: {rect}")
+            print(f"Tracker OK: {rect}")
         else:
             self.state = TrackerState.LOST
             self.confidence = 0.0
-            logger.warning(f"Tracker initialization failed for rect: {rect}")
+            # Try to get more info — extract the roi and check it
+            x, y, w, h = rect
+            roi = frame[y:y+h, x:x+w]
+            print(f"Tracker init FAILED: rect={rect} roi_shape={roi.shape} roi_mean={roi.mean():.1f} roi_std={roi.std():.1f}")
         
         self._update_metrics()
 
@@ -221,6 +244,9 @@ class Tracker:
         # Ensure frame is color
         if len(frame.shape) == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        
+        # Ensure C-contiguous memory layout
+        frame = np.ascontiguousarray(frame)
         
         self.frame_h, self.frame_w = frame.shape[:2]
         self.last_timestamp = timestamp
